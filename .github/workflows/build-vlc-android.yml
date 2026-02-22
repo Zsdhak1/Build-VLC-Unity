@@ -1,0 +1,63 @@
+name: Build VLC for Unity (Android ARM64)
+
+# 允许手动在 Actions 页面点击 "Run workflow" 触发编译
+on:
+  workflow_dispatch: 
+
+jobs:
+  build-android:
+    # 采用带有基础 C++ 和 Android SDK/NDK 预装的 Linux 运行环境
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout Unity VLC Wrapper Repository
+      uses: actions/checkout@v4
+      with:
+        repository: videolan/vlc-unity
+        ref: master
+        fetch-depth: 1
+
+    # 预先清理并配置构建需要的环境变量
+    - name: Setup Environment Variables
+      run: |
+        echo "NDK_VERSION=25.2.9519653" >> $GITHUB_ENV
+        # Meta Quest 属于较新的 Android 平台，API Level 29 比较合适 (Android 10)
+        echo "ANDROID_API=29" >> $GITHUB_ENV 
+
+    - name: Setup Android NDK
+      uses: nttld/setup-ndk@v1
+      id: setup-ndk
+      with:
+        ndk-version: 25.2.9519653
+        add-to-path: true
+
+    - name: Configure CMake for Android ARM64
+      run: |
+        mkdir build-android-arm64
+        cd build-android-arm64
+        
+        # 使用 NDK 内置的 Toolchain 配置文件
+        cmake .. \
+          -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+          -DANDROID_ABI=arm64-v8a \
+          -DANDROID_PLATFORM=android-${ANDROID_API} \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_SHARED_LIBS=ON \
+          # 对该项目关闭测试与桌面端模块，加快编译
+          -DVLC_UNITY_TESTS=OFF \
+          -DVLC_UNITY_DESKTOP=OFF
+
+    - name: Compile libvlc-unity.so
+      run: |
+        cd build-android-arm64
+        # 利用云端的多核性能进行加速编译
+        make -j$(nproc)
+
+    # 编译完成后，将生成的静态/动态库作为构件上传，供你下载
+    - name: Upload Artifact (libvlc-unity)
+      uses: actions/upload-artifact@v4
+      with:
+        name: libvlc-unity-android-arm64
+        path: |
+          build-android-arm64/libvlc-unity.so
+          build-android-arm64/**/*.so
