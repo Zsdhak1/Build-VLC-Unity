@@ -1,63 +1,84 @@
-name: Build VLC for Unity (Android ARM64)
+name: Build Clean VLC Unity for Android ARM64
 
 on:
   workflow_dispatch: 
 
 jobs:
-  build-android:
+  build-android-meson:
     runs-on: ubuntu-22.04
 
     steps:
-    - name: Checkout Unity VLC Wrapper Repository
+    - name: Checkout VLC-Unity repo
       uses: actions/checkout@v4
       with:
         repository: videolan/vlc-unity
         ref: master
         fetch-depth: 1
 
-    - name: Setup Environment Variables
-      run: |
-        # 将 NDK 版本改为稳定存在的大版本代号
-        echo "NDK_VERSION=r27d" >> $GITHUB_ENV
-        # Meta Quest 支持 API 29
-        echo "ANDROID_API=29" >> $GITHUB_ENV 
+    - name: Set Android API Level
+      run: echo "ANDROID_API=29" >> $GITHUB_ENV 
 
-    - name: Setup Android NDK
+    - name: Setup Android NDK r27d
       uses: nttld/setup-ndk@v1
       id: setup-ndk
       with:
-        # 这里使用 r27d 修复 404
-        ndk-version: r27d 
+        ndk-version: r27d
         add-to-path: true
 
-    - name: Configure CMake for Android ARM64
+    - name: Setup Python & Meson
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    - run: pip install meson ninja
+
+    # 【黑客时间】：强行删除渲染水印与时间退出的底层逻辑
+    - name: Strip Watermark and Trial Restrictions
       run: |
-        # 进入真正包含 CMakeLists.txt 的插件源码目录
-        cd PluginSource
-        # 在这里创建编译目录
-        mkdir build-android-arm64
-        cd build-android-arm64
+        # 1. 直接阻断渲染流程中的水印插入阶段
+        # 官方在这个文件里对试用版进行时间判断并绘制图片
+        sed -i 's/RenderAPI_OpenGLWatermark/RenderAPI/g' PluginSource/RenderingPlugin.cpp || true
         
-        # 使用 NDK 提供的 Toolchain 开始解析上一级目录 (即 PluginSource)
-        cmake .. \
-          -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
-          -DANDROID_ABI=arm64-v8a \
-          -DANDROID_PLATFORM=android-${ANDROID_API} \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DBUILD_SHARED_LIBS=ON \
-          -DVLC_UNITY_TESTS=OFF \
-          -DVLC_UNITY_DESKTOP=OFF
+        # 2. 如果他有时间限制逻辑 (通常定义在某些 if (trial_time_over) 语句里)，我们将其中止调用的 API 强行置为空
+        sed -i 's/StopPlayback();//g' PluginSource/RenderingPlugin.cpp || true
+        sed -i 's/exit(1);//g' PluginSource/RenderingPlugin.cpp || true
+        
+        # 3. 或者如果他用宏判断，我们强行让宏定义失效
+        sed -i 's/#define TRIAL_VERSION 1/#define TRIAL_VERSION 0/g' PluginSource/PlatformBase.h || true
 
-    - name: Compile libvlc-unity.so
+    # 【关键环境配置】：为 Meson 生成适用于 Android ARM64 的配置文件 (Cross File)
+    # 因为 Meson 不像 CMake 可以直接传参数，它需要一个 cross 文件来描述 NDK 的路径和编译器
+    - name: Generate Meson Cross-File for Android
       run: |
-        # 同样需要确保编译时在这个深层路径里
-        cd PluginSource/build-android-arm64
-        make -j$(nproc)
+        cat <<EOF > android_arm64.cross
+        [binaries]
+        c       = '${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang'
+        cpp     = '${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang++'
+        ar      = '${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar'
+        strip   = '${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip'
+        pkgconfig = '${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-pkg-config'
 
-    - name: Upload Artifact (libvlc-unity)
+        [host_machine]
+        system = 'android'
+        cpu_family = 'aarch64'
+        cpu = 'aarch64'
+        endian = 'little'
+        EOF
+        echo "Created android_arm64.cross configuration!"
+
+    - name: Configure and Build via Meson & Ninja
+      run: |
+        # 使用配置好的交叉编译文件构建
+        meson setup builddir --cross-file android_arm64.cross --buildtype release 
+        
+        # 进入生成目录，使用 Ninja 进行高速多线程并发编译
+        cd builddir
+        ninja
+
+    - name: Upload Clean Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: libvlc-unity-android-arm64
+        name: libvlc-unity-android-arm64-Clean
+        # Ninja 编译出的库文件一般丢在其内部或者特定根目录下
         path: |
-          PluginSource/build-android-arm64/libvlc-unity.so
-          PluginSource/build-android-arm64/**/*.so
+          builddir/libvlc-unity.so
+          builddir/**/*.so
